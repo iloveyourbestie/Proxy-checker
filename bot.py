@@ -4,13 +4,10 @@ import time
 import asyncio
 import logging
 import aiohttp
-from pathlib import Path
+import requests
+import tarfile
 
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,7 +22,11 @@ import geoip2.database
 # ================== HARD CONFIG ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = 8537424608  # RAW OWNER ID
+
+OWNER_ID = 8537424608  # 🔥 RAW OWNER ID
+
+MAXMIND_ACCOUNT_ID = os.getenv("MAXMIND_ACCOUNT_ID")
+MAXMIND_LICENSE_KEY = os.getenv("MAXMIND_LICENSE_KEY")
 
 REQUIRED_CHANNELS = ["@legendyt830", "@youXyash"]
 
@@ -34,7 +35,7 @@ RESULTS_DIR = f"{DATA_DIR}/results"
 GEO_DB = f"{DATA_DIR}/GeoLite2-City.mmdb"
 
 TIMEOUT = aiohttp.ClientTimeout(total=15)
-MAX_CONCURRENCY = 50  # accurate & stable
+MAX_CONCURRENCY = 50  # accurate, not fake-fast
 
 # ================== LOGGING ==================
 
@@ -70,20 +71,56 @@ def save(name, data):
     with open(f"{DATA_DIR}/{name}", "w") as f:
         json.dump(data, f, indent=2)
 
-# ================== GEO ==================
+# ================== GEO DB AUTO DOWNLOAD ==================
 
-geo_reader = geoip2.database.Reader(GEO_DB)
+def ensure_geolite_db():
+    if os.path.exists(GEO_DB):
+        return
+
+    logging.info("⬇️ Downloading GeoLite2 City database")
+
+    url = "https://download.maxmind.com/app/geoip_download"
+    params = {
+        "edition_id": "GeoLite2-City",
+        "license_key": MAXMIND_LICENSE_KEY,
+        "suffix": "tar.gz",
+    }
+
+    r = requests.get(
+        url,
+        params=params,
+        auth=(MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY),
+        timeout=30,
+    )
+    r.raise_for_status()
+
+    tar_path = f"{DATA_DIR}/geo.tar.gz"
+    with open(tar_path, "wb") as f:
+        f.write(r.content)
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for m in tar.getmembers():
+            if m.name.endswith("GeoLite2-City.mmdb"):
+                m.name = os.path.basename(m.name)
+                tar.extract(m, DATA_DIR)
+
+    os.remove(tar_path)
+    logging.info("✅ GeoLite2 City ready")
+
+# ================== GEO LOOKUP ==================
+
+geo_reader = None
 
 def geo_lookup(ip):
     try:
         r = geo_reader.city(ip)
-        return {
-            "country": r.country.name or "Unknown",
-            "city": r.city.name or "Unknown",
-            "isp": r.traits.isp or "Unknown",
-        }
+        return (
+            r.country.name or "Unknown",
+            r.city.name or "Unknown",
+            r.traits.isp or "Unknown",
+        )
     except:
-        return {"country": "Unknown", "city": "Unknown", "isp": "Unknown"}
+        return ("Unknown", "Unknown", "Unknown")
 
 # ================== FORCE JOIN ==================
 
@@ -99,10 +136,10 @@ async def is_joined(bot, uid):
 
 # ================== SMART SCORE ==================
 
-def smart_score(latency_ms, uptime):
-    return round((100 - min(latency_ms / 15, 80)) + (uptime * 15), 2)
+def smart_score(latency, uptime):
+    return round((100 - min(latency / 10, 80)) + uptime * 10, 2)
 
-# ================== AUTO DETECTION ==================
+# ================== AUTO DETECT ==================
 
 def auto_detect(proxy):
     return "http"
@@ -111,7 +148,9 @@ def auto_detect(proxy):
 
 async def check_proxy(proxy, ptype):
     start = time.time()
-    ip = proxy.split(":")[0]
+    parts = proxy.split(":")
+    ip = parts[0]
+
     proxy_url = f"{ptype}://{proxy}"
 
     try:
@@ -125,14 +164,14 @@ async def check_proxy(proxy, ptype):
                     return None
 
         latency = int((time.time() - start) * 1000)
-        geo = geo_lookup(ip)
+        country, city, isp = geo_lookup(ip)
 
         return {
             "proxy": proxy,
             "latency": latency,
-            "country": geo["country"],
-            "city": geo["city"],
-            "isp": geo["isp"],
+            "country": country,
+            "city": city,
+            "isp": isp,
         }
     except:
         return None
@@ -143,7 +182,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_joined(context.bot, update.effective_user.id):
         kb = [[InlineKeyboardButton("✅ I Joined", callback_data="recheck")]]
         return await update.message.reply_text(
-            "❌ Join required channels first.",
+            "❌ Join required channels first",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
@@ -153,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🚀 *PROXY CHECKER*\n\n"
-        "• Accurate validation\n"
+        "• Real proxy validation\n"
         "• Country / City / ISP\n"
         "• CPM + ETA\n"
         "• Smart Score ranking\n\n"
@@ -192,7 +231,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ptype = context.user_data.get("ptype")
 
     if not ptype:
-        return await update.message.reply_text("❌ Select proxy type first.")
+        return await update.message.reply_text("❌ Select proxy type first")
 
     file = await update.message.document.get_file()
     proxies = (await file.download_as_bytearray()).decode().splitlines()
@@ -205,11 +244,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked = 0
     start_time = time.time()
 
-    progress = await update.message.reply_text("⏳ Starting proxy check...")
-    last_progress_text = ""
+    msg = await update.message.reply_text("⏳ Starting checks...")
 
     async def runner(p):
-        nonlocal checked, last_progress_text
+        nonlocal checked
         async with sem:
             r = await check_proxy(p, ptype)
             checked += 1
@@ -217,19 +255,19 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if r:
                 results.append(r)
 
-            elapsed = time.time() - start_time
-            cpm = int((checked / max(elapsed, 1)) * 60)
-            eta = int(((len(proxies) - checked) / max(checked, 1)) * elapsed)
+            if checked % 10 == 0 or checked == len(proxies):
+                elapsed = max(time.time() - start_time, 1)
+                cpm = int((checked / elapsed) * 60)
+                eta = int(((len(proxies) - checked) / checked) * elapsed)
 
-            progress_text = (
-                f"📊 {checked}/{len(proxies)}\n"
-                f"⚡ CPM: {cpm}\n"
-                f"⏱ ETA: {eta}s"
-            )
-
-            if progress_text != last_progress_text:
-                await progress.edit_text(progress_text)
-                last_progress_text = progress_text
+                try:
+                    await msg.edit_text(
+                        f"📊 {checked}/{len(proxies)}\n"
+                        f"⚡ CPM: {cpm}\n"
+                        f"⏱ ETA: {eta}s"
+                    )
+                except:
+                    pass
 
     await asyncio.gather(*[runner(p) for p in proxies])
 
@@ -239,7 +277,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save("uptime.json", uptime)
 
     for r in results:
-        r["score"] = smart_score(r["latency"], uptime.get(r["proxy"], 1))
+        r["score"] = smart_score(r["latency"], uptime[r["proxy"]])
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
@@ -259,15 +297,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checks["total"] += len(proxies)
     save("checks_count.json", checks)
 
-    await progress.edit_text(
-        f"✅ DONE\n"
-        f"🟢 Live: {len(results)}\n"
-        f"🔴 Dead: {len(proxies) - len(results)}"
+    await msg.edit_text(
+        f"✅ DONE\n🟢 Live: {len(results)}\n🔴 Dead: {len(proxies)-len(results)}"
     )
 
     await update.message.reply_document(document=open(out, "rb"))
 
-# ================== ADMIN PANEL ==================
+# ================== ADMIN ==================
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -275,52 +311,30 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load("users.json")
     checks = load("checks_count.json")
     await update.message.reply_text(
-        f"👑 ADMIN STATS\n\n"
-        f"👤 Users: {len(users)}\n"
-        f"📊 Total checks: {checks['total']}"
+        f"👑 ADMIN\n\nUsers: {len(users)}\nChecks: {checks['total']}"
     )
-
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    uid = context.args[0]
-    bans = load("ban.json")
-    if uid not in bans:
-        bans.append(uid)
-    save("ban.json", bans)
-    await update.message.reply_text("🚫 User banned")
-
-async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    uid = context.args[0]
-    bans = load("ban.json")
-    if uid in bans:
-        bans.remove(uid)
-    save("ban.json", bans)
-    await update.message.reply_text("✅ User unbanned")
 
 # ================== MAIN ==================
 
 async def main():
     ensure_storage()
+    ensure_geolite_db()
+
+    global geo_reader
+    geo_reader = geoip2.database.Reader(GEO_DB)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("unban", unban))
 
     app.add_handler(CallbackQueryHandler(recheck, pattern="recheck"))
     app.add_handler(CallbackQueryHandler(proxy_type))
-    app.add_handler(
-        MessageHandler(filters.Document.FileExtension("txt"), handle_file)
-    )
+    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_file))
 
-    logging.info("✅ BOT STARTED")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logging.info("✅ BOT READY")
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
