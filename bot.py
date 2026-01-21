@@ -3,13 +3,12 @@ import json
 import time
 import asyncio
 import aiohttp
-import logging
-from datetime import datetime
+from pathlib import Path
+from aiohttp_socks import ProxyConnector
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Document,
 )
 from telegram.ext import (
     Application,
@@ -22,221 +21,258 @@ from telegram.ext import (
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set")
-
 OWNER_ID = 8537424608
-FORCE_JOIN_CHANNELS = ["legendyt830", "youXyash"]
 
-DATA_DIR = "data"
-RESULT_DIR = f"{DATA_DIR}/results"
-USERS_FILE = f"{DATA_DIR}/users.json"
-CHECKS_FILE = f"{DATA_DIR}/checks_count.json"
-BAN_FILE = f"{DATA_DIR}/ban.json"
+FORCE_JOIN_CHANNELS = [
+    "@legendyt830",
+    "@youXyash",
+]
+
+DATA_DIR = Path("data")
+RESULTS_DIR = DATA_DIR / "results"
+USERS_FILE = DATA_DIR / "users.json"
+CHECKS_FILE = DATA_DIR / "checks_count.json"
+BANS_FILE = DATA_DIR / "ban.json"
+
+TIMEOUT = aiohttp.ClientTimeout(total=8)
+SEM = asyncio.Semaphore(30)
+TEST_URL = "https://api.ipify.org?format=json"
 # =========================================
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("PROXY")
 
-# ========== STORAGE INIT ==========
-def safe_json(path, default):
+# ================= STORAGE =================
+def ensure_storage():
+    DATA_DIR.mkdir(exist_ok=True)
+    RESULTS_DIR.mkdir(exist_ok=True)
+
+    for file, default in [
+        (USERS_FILE, {}),
+        (CHECKS_FILE, {"total": 0}),
+        (BANS_FILE, []),
+    ]:
+        if not file.exists() or file.stat().st_size == 0:
+            file.write_text(json.dumps(default))
+
+def load_json(path, default):
     try:
-        if not os.path.exists(path) or os.stat(path).st_size == 0:
-            raise ValueError
-        with open(path, "r") as f:
-            return json.load(f)
+        return json.loads(path.read_text())
     except:
-        with open(path, "w") as f:
-            json.dump(default, f, indent=2)
+        path.write_text(json.dumps(default))
         return default
 
-def init_storage():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(RESULT_DIR, exist_ok=True)
+def save_json(path, data):
+    path.write_text(json.dumps(data, indent=2))
 
-    users = safe_json(USERS_FILE, {})
-    checks = safe_json(CHECKS_FILE, {"total": 0})
-    bans = set(safe_json(BAN_FILE, []))
-    return users, checks, bans
+ensure_storage()
 
-users, checks_count, banned_users = init_storage()
+users = load_json(USERS_FILE, {})
+checks_count = load_json(CHECKS_FILE, {"total": 0})
+banned_users = set(load_json(BANS_FILE, []))
+# =========================================
 
-# ========== FORCE JOIN ==========
-async def check_access(update, context):
-    uid = update.effective_user.id
 
-    if uid == OWNER_ID:
-        return True
-
-    if uid in banned_users:
-        await update.message.reply_text("🚫 You are banned.")
-        return False
-
+# ================= FORCE JOIN =================
+async def is_member(bot, user_id):
     for ch in FORCE_JOIN_CHANNELS:
         try:
-            m = await context.bot.get_chat_member(f"@{ch}", uid)
-            if m.status in ("left", "kicked"):
-                raise Exception
+            m = await bot.get_chat_member(ch, user_id)
+            if m.status not in ("member", "administrator", "creator"):
+                return False
         except:
-            await update.message.reply_text(
-                "🔒 **Join required channels**",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 @legendyt830", url="https://t.me/legendyt830")],
-                    [InlineKeyboardButton("📢 @youXyash", url="https://t.me/youXyash")],
-                    [InlineKeyboardButton("✅ I Joined", callback_data="recheck")]
-                ])
-            )
             return False
-
-    users[str(uid)] = True
-    json.dump(users, open(USERS_FILE, "w"), indent=2)
     return True
+# =============================================
 
-# ========== PROXY CHECK ==========
-async def check_proxy(session, proxy, ptype):
-    url = "http://httpbin.org/ip"
-    proxy_url = f"{ptype}://{proxy}"
+
+# ================= PROXY PARSER =================
+def parse_proxy(line: str):
+    line = line.strip()
+    if not line:
+        return None
+
+    # Detect auth
+    auth = "@" in line
+
+    # Detect scheme
+    if line.startswith("http://"):
+        return "http", line
+    if line.startswith("https://"):
+        return "https", line
+    if line.startswith("socks4://"):
+        return "socks4", line
+    if line.startswith("socks5://"):
+        return "socks5", line
+
+    # Guess based on port / auth
+    if auth:
+        return "http", "http://" + line
+
+    return "http", "http://" + line
+# ===============================================
+
+
+# ================= PROXY CHECK =================
+async def check_proxy(proxy_type, proxy_url):
     start = time.time()
 
     try:
-        async with session.get(
-            url,
-            proxy=proxy_url,
-            timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False
-        ) as r:
-            if r.status == 200:
-                latency = int((time.time() - start) * 1000)
-                country = r.headers.get("X-Forwarded-For", "Unknown")
-                return proxy, latency, country
+        async with SEM:
+            if proxy_type in ("http", "https"):
+                async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+                    async with session.get(
+                        TEST_URL,
+                        proxy=proxy_url,
+                        ssl=False,
+                    ) as r:
+                        if r.status == 200:
+                            latency = int((time.time() - start) * 1000)
+                            return True, latency
+
+            else:  # SOCKS4 / SOCKS5
+                connector = ProxyConnector.from_url(proxy_url)
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=TIMEOUT
+                ) as session:
+                    async with session.get(TEST_URL, ssl=False) as r:
+                        if r.status == 200:
+                            latency = int((time.time() - start) * 1000)
+                            return True, latency
+
     except:
-        return None
+        pass
 
-# ========== COMMANDS ==========
-async def start(update, context):
-    await update.message.reply_text(
-        "👋 **PROXY CHECKER**\n\n"
-        "⚡ Async • Live CPM • Country • Latency\n\n"
-        "📌 /check — Start checking\n"
-        "📂 /history — Your results",
-        parse_mode="Markdown"
-    )
+    return False, None
+# ===============================================
 
-async def check(update, context):
-    if not await check_access(update, context):
-        return
-    await update.message.reply_text(
-        "🧪 **Select proxy type**",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 HTTP", callback_data="http")],
-            [InlineKeyboardButton("🔐 HTTPS", callback_data="https")],
-            [InlineKeyboardButton("🧦 SOCKS5", callback_data="socks5")],
-        ])
-    )
 
-async def history(update, context):
+# ================= COMMANDS =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    hist = f"{RESULT_DIR}/{uid}/history.json"
-    if not os.path.exists(hist):
-        await update.message.reply_text("📭 No history yet.")
+    if uid in banned_users:
         return
-    await update.message.reply_document(open(hist, "rb"))
 
-# ========== CALLBACK ==========
-async def proxy_type_selected(update, context):
+    users[uid] = users.get(uid, 0) + 1
+    save_json(USERS_FILE, users)
+
+    await update.message.reply_text(
+        "👋 **Proxy Checker Bot**\n\n"
+        "⚡ HTTP / HTTPS / SOCKS4 / SOCKS5\n"
+        "🔐 Private proxy supported\n\n"
+        "📌 Commands:\n"
+        "/check – Start checking\n"
+        "/history – Your results",
+        parse_mode="Markdown",
+    )
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if str(uid) in banned_users:
+        return
+
+    if not await is_member(context.bot, uid):
+        buttons = [
+            [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{c[1:]}")]
+            for c in FORCE_JOIN_CHANNELS
+        ]
+        buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="recheck")])
+
+        await update.message.reply_text(
+            "🔒 **Join required channels first**",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(
+        "📤 **Upload proxy .txt file**\n\n"
+        "Supported formats:\n"
+        "`ip:port`\n"
+        "`user:pass@ip:port`\n"
+        "`socks5://ip:port`",
+        parse_mode="Markdown",
+    )
+
+async def recheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    context.user_data["ptype"] = update.callback_query.data
-    await update.callback_query.edit_message_text("📤 Upload `.txt` proxy file")
+    if await is_member(context.bot, update.effective_user.id):
+        await update.callback_query.message.edit_text(
+            "✅ Access granted\n\nSend /check again"
+        )
+# ===============================================
 
-# ========== FILE HANDLER ==========
-async def handle_file(update, context):
-    if not await check_access(update, context):
+
+# ================= FILE HANDLER =================
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    doc = update.message.document
+    file = await doc.get_file()
+    raw = (await file.download_as_bytearray()).decode(errors="ignore")
+
+    parsed = [parse_proxy(l) for l in raw.splitlines()]
+    proxies = [p for p in parsed if p]
+
+    total = len(proxies)
+    if total == 0:
         return
 
-    uid = str(update.effective_user.id)
-    ptype = context.user_data.get("ptype")
-    if not ptype:
-        return await update.message.reply_text("Use /check first")
+    user_dir = RESULTS_DIR / str(uid)
+    user_dir.mkdir(exist_ok=True)
 
-    os.makedirs(f"{RESULT_DIR}/{uid}", exist_ok=True)
+    live, dead = [], []
 
-    doc: Document = update.message.document
-    file = await doc.get_file()
-    proxies = (await file.download_as_bytearray()).decode().splitlines()
-    proxies = [p.strip() for p in proxies if p.strip()]
-
-    msg = await update.message.reply_text("⏳ Starting check...")
-
-    good = []
+    msg = await update.message.reply_text("⏳ Checking... 0%")
     start_time = time.time()
 
-    async with aiohttp.ClientSession() as session:
-        sem = asyncio.Semaphore(50)
+    for i, (ptype, purl) in enumerate(proxies, 1):
+        ok, latency = await check_proxy(ptype, purl)
+        if ok:
+            live.append(f"{purl} | {latency}ms")
+        else:
+            dead.append(purl)
 
-        async def run(p):
-            async with sem:
-                return await check_proxy(session, p, ptype)
+        if i % 5 == 0 or i == total:
+            percent = int(i / total * 100)
+            await msg.edit_text(f"⏳ Checking... {percent}%")
 
-        tasks = [run(p) for p in proxies]
+        await asyncio.sleep(0.05)
 
-        done = 0
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            done += 1
+    (user_dir / "live.txt").write_text("\n".join(live))
+    (user_dir / "dead.txt").write_text("\n".join(dead))
 
-            if res:
-                good.append(res)
+    checks_count["total"] += total
+    save_json(CHECKS_FILE, checks_count)
 
-            elapsed = time.time() - start_time
-            cpm = int(done / elapsed * 60) if elapsed > 0 else 0
-            percent = int(done / len(proxies) * 100)
-
-            if done % 10 == 0:
-                await msg.edit_text(
-                    f"⚡ **Live Checking**\n\n"
-                    f"📊 Progress: `{percent}%`\n"
-                    f"🚀 CPM: `{cpm}`\n"
-                    f"✅ Good: `{len(good)}`",
-                    parse_mode="Markdown"
-                )
-
-    out = f"{RESULT_DIR}/{uid}/{ptype}_checked.txt"
-    with open(out, "w") as f:
-        for p, ms, c in good:
-            f.write(f"{p} | {ms}ms | {c}\n")
-
-    hist = f"{RESULT_DIR}/{uid}/history.json"
-    history = safe_json(hist, [])
-    history.append({
-        "type": ptype,
-        "total": len(proxies),
-        "good": len(good),
-        "time": datetime.utcnow().isoformat()
-    })
-    json.dump(history, open(hist, "w"), indent=2)
-
-    checks_count["total"] += 1
-    json.dump(checks_count, open(CHECKS_FILE, "w"), indent=2)
+    elapsed = max(1, time.time() - start_time)
+    cpm = int((total / elapsed) * 60)
 
     await msg.edit_text(
-        f"✅ **Completed**\n\n"
-        f"🟢 Working: `{len(good)}`\n"
-        f"🔴 Dead: `{len(proxies)-len(good)}`",
-        parse_mode="Markdown"
+        f"✅ **Check Completed**\n\n"
+        f"🟢 Live: {len(live)}\n"
+        f"🔴 Dead: {len(dead)}\n"
+        f"⚡ CPM: {cpm}",
+        parse_mode="Markdown",
     )
-    await update.message.reply_document(open(out, "rb"))
 
-# ========== MAIN ==========
+    if live:
+        await update.message.reply_document(
+            document=(user_dir / "live.txt").open("rb"),
+            caption="🟢 Live Proxies",
+        )
+# ===============================================
+
+
+# ================= MAIN =================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CallbackQueryHandler(proxy_type_selected))
-    app.add_handler(MessageHandler(filters.Document.TEXT, handle_file))
+    app.add_handler(CallbackQueryHandler(recheck, pattern="recheck"))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_file))
 
+    print("✅ Bot running")
     app.run_polling()
 
 if __name__ == "__main__":
