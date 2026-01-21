@@ -257,4 +257,12 @@ def main():
 # ===========================================
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            main()
+        else:
+            main()
+    except RuntimeError:
+        main()
