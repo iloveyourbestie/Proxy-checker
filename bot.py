@@ -37,25 +37,35 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 def ensure_file(path, default):
-    if not os.path.exists(path):
+    """Ensure file exists and is valid JSON, reset if corrupted"""
+    try:
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                json.dump(default, f, indent=2)
+            return default
+        
+        # Check if file is empty or corrupted
+        with open(path, "r") as f:
+            content = f.read().strip()
+            if not content:  # Empty file
+                raise json.JSONDecodeError("Empty file", content, 0)
+            
+            data = json.loads(content)
+            return data
+            
+    except (json.JSONDecodeError, Exception):
+        # File is corrupted, recreate it
+        print(f"Warning: {path} is corrupted. Recreating with default data.")
         with open(path, "w") as f:
-            json.dump(default, f)
+            json.dump(default, f, indent=2)
+        return default
 
-ensure_file(USERS_FILE, {})
-ensure_file(CHECKS_FILE, {"total_checks": 0})
-ensure_file(BAN_FILE, [])
+# Initialize or load data files
+users = ensure_file(USERS_FILE, {})
+checks_count = ensure_file(CHECKS_FILE, {"total_checks": 0})
+ban_list = ensure_file(BAN_FILE, [])
+banned_users = set(ban_list)
 # ======================================
-
-# ========== LOAD DATA ==========
-with open(USERS_FILE) as f:
-    users = json.load(f)
-
-with open(CHECKS_FILE) as f:
-    checks_count = json.load(f)
-
-with open(BAN_FILE) as f:
-    banned_users = set(json.load(f))
-# ==============================
 
 # =============== FORCE JOIN =================
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -117,10 +127,14 @@ async def start(update, context):
 async def stats(update, context):
     if update.effective_user.id != OWNER_ID:
         return
+    # Reload stats to ensure we have latest data
+    global checks_count
+    checks_count = ensure_file(CHECKS_FILE, {"total_checks": 0})
+    
     await update.message.reply_text(
         f"📊 Bot Stats\n\n"
         f"👤 Users: {len(users)}\n"
-        f"📂 Total checks: {checks_count['total_checks']}"
+        f"📂 Total checks: {checks_count.get('total_checks', 0)}"
     )
 
 async def ban(update, context):
@@ -134,6 +148,21 @@ async def ban(update, context):
         await update.message.reply_text(f"✅ User {uid} banned")
     except:
         await update.message.reply_text("Usage: /ban <user_id>")
+
+async def unban(update, context):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        uid = int(context.args[0])
+        if uid in banned_users:
+            banned_users.remove(uid)
+            with open(BAN_FILE, "w") as f:
+                json.dump(list(banned_users), f, indent=2)
+            await update.message.reply_text(f"✅ User {uid} unbanned")
+        else:
+            await update.message.reply_text(f"❌ User {uid} is not banned")
+    except:
+        await update.message.reply_text("Usage: /unban <user_id>")
 
 async def check(update, context):
     if not await check_access(update, context):
@@ -152,7 +181,7 @@ async def proxy_type_selected(update, context):
     query = update.callback_query
     await query.answer()
     context.user_data["proxy_type"] = query.data
-    await query.message.reply_text("📤 Upload proxy file (.txt)")
+    await query.edit_message_text("📤 Upload proxy file (.txt)")
 # ===========================================
 
 # ============ FILE HANDLER ==================
@@ -171,42 +200,82 @@ async def handle_file(update, context):
     os.makedirs(user_dir, exist_ok=True)
 
     doc: Document = update.message.document
+    if not doc.file_name.endswith('.txt'):
+        await update.message.reply_text("❗ Please upload a .txt file.")
+        return
+
     file = await doc.get_file()
     data = await file.download_as_bytearray()
-    proxies = data.decode().splitlines()
+    
+    try:
+        proxies = data.decode().splitlines()
+        proxies = [p.strip() for p in proxies if p.strip()]
+    except:
+        await update.message.reply_text("❗ Error reading file. Make sure it's a valid text file.")
+        return
+
+    if not proxies:
+        await update.message.reply_text("❗ No proxies found in the file.")
+        return
+
+    msg = await update.message.reply_text(f"🔍 Checking {len(proxies)} proxies... This may take a while.")
 
     good = []
+    bad = 0
+    
+    # Limit concurrent checks to avoid rate limiting
     async with aiohttp.ClientSession() as session:
+        tasks = []
         for p in proxies:
-            res = await check_proxy(session, p)
-            if res:
-                good.append(res)
+            tasks.append(check_proxy(session, p))
+        
+        results = await asyncio.gather(*tasks)
+        
+        for proxy, result in zip(proxies, results):
+            if result:
+                good.append(proxy)
+            else:
+                bad += 1
 
-    out_path = os.path.join(user_dir, f"{proxy_type}_checked.txt")
+    out_path = os.path.join(user_dir, f"{proxy_type}_checked_{int(asyncio.get_event_loop().time())}.txt")
     with open(out_path, "w") as f:
         f.write("\n".join(good))
 
-    checks_count["total_checks"] += 1
+    # Update checks count
+    checks_count["total_checks"] = checks_count.get("total_checks", 0) + 1
     with open(CHECKS_FILE, "w") as f:
         json.dump(checks_count, f, indent=2)
 
-    await update.message.reply_document(
-        document=open(out_path, "rb"),
-        caption=f"✅ Done. Working: {len(good)}"
-    )
+    await msg.edit_text(f"✅ Check completed!\n✅ Working: {len(good)}\n❌ Dead: {bad}")
+    
+    if good:
+        await update.message.reply_document(
+            document=open(out_path, "rb"),
+            caption=f"✅ {len(good)} working proxies found."
+        )
+    else:
+        await update.message.reply_text("❌ No working proxies found.")
 # ===========================================
 
 # ================= MAIN =====================
 async def main():
+    print("🤖 Bot is starting...")
+    print(f"📁 Data directory: {DATA_DIR}")
+    print(f"👤 Registered users: {len(users)}")
+    print(f"📊 Total checks: {checks_count.get('total_checks', 0)}")
+    print(f"🚫 Banned users: {len(banned_users)}")
+    
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CallbackQueryHandler(proxy_type_selected))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
+    print("✅ Bot is ready!")
     await app.run_polling()
 
 if __name__ == "__main__":
