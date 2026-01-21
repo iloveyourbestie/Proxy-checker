@@ -2,15 +2,16 @@ import os
 import json
 import time
 import asyncio
-import aiohttp
-import aiofiles
 import logging
+import aiohttp
+import tarfile
+import requests
 from pathlib import Path
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -23,239 +24,340 @@ from telegram.ext import (
 
 import geoip2.database
 
-# ================= CONFIG =================
+# ================== HARD CONFIG ==================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = 8537424608
+OWNER_ID = 8537424608  # 🔥 RAW OWNER ID
+
+MAXMIND_ACCOUNT_ID = os.getenv("MAXMIND_ACCOUNT_ID")
+MAXMIND_LICENSE_KEY = os.getenv("MAXMIND_LICENSE_KEY")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
+
+if not MAXMIND_LICENSE_KEY:
+    raise RuntimeError("MAXMIND_LICENSE_KEY not set")
+
 REQUIRED_CHANNELS = ["@legendyt830", "@youXyash"]
 
-DATA_DIR = Path("data")
-HISTORY_DIR = DATA_DIR / "history"
-USERS_FILE = DATA_DIR / "users.json"
-BANS_FILE = DATA_DIR / "bans.json"
-GEO_DB = "GeoLite2-Country.mmdb"
-# =========================================
+DATA_DIR = "data"
+RESULTS_DIR = f"{DATA_DIR}/results"
+GEO_DB = f"{DATA_DIR}/GeoLite2-City.mmdb"
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("proxybot")
+TIMEOUT = aiohttp.ClientTimeout(total=15)
+MAX_CONCURRENCY = 50  # accurate, not fake-fast
 
-# ============ STORAGE INIT ============
-def safe_json_load(path, default):
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return default
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return default
+# ================== LOGGING ==================
 
-def safe_json_save(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+# ================== STORAGE ==================
+
+def ensure_storage():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    defaults = {
+        "users.json": {},
+        "checks_count.json": {"total": 0},
+        "ban.json": [],
+        "uptime.json": {},
+    }
+
+    for name, default in defaults.items():
+        path = f"{DATA_DIR}/{name}"
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            with open(path, "w") as f:
+                json.dump(default, f)
+
+def load(name):
+    with open(f"{DATA_DIR}/{name}", "r") as f:
+        return json.load(f)
+
+def save(name, data):
+    with open(f"{DATA_DIR}/{name}", "w") as f:
         json.dump(data, f, indent=2)
 
-DATA_DIR.mkdir(exist_ok=True)
-HISTORY_DIR.mkdir(exist_ok=True)
+# ================== GEO DOWNLOAD ==================
 
-users = safe_json_load(USERS_FILE, {})
-banned = set(safe_json_load(BANS_FILE, []))
+def ensure_geolite():
+    if os.path.exists(GEO_DB):
+        return
 
-# ============ GEO ============
-geo_reader = geoip2.database.Reader(GEO_DB)
+    logging.info("⬇️ Downloading GeoLite2 City DB")
 
-def get_country(ip):
+    url = (
+        "https://download.maxmind.com/app/geoip_download"
+        f"?edition_id=GeoLite2-City&license_key={MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+    )
+
+    tar_path = f"{DATA_DIR}/geo.tar.gz"
+
+    r = requests.get(url, stream=True)
+    with open(tar_path, "wb") as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for m in tar.getmembers():
+            if m.name.endswith(".mmdb"):
+                m.name = os.path.basename(m.name)
+                tar.extract(m, DATA_DIR)
+
+    os.remove(tar_path)
+    logging.info("✅ GeoLite2 ready")
+
+# ================== GEO LOOKUP ==================
+
+geo_reader = None
+
+def geo_lookup(ip):
     try:
-        return geo_reader.country(ip).country.iso_code or "??"
+        r = geo_reader.city(ip)
+        return {
+            "country": r.country.name or "Unknown",
+            "city": r.city.name or "Unknown",
+            "isp": r.traits.isp or "Unknown",
+        }
     except:
-        return "??"
+        return {"country": "Unknown", "city": "Unknown", "isp": "Unknown"}
 
-# ============ FORCE JOIN ============
-async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+# ================== FORCE JOIN ==================
 
-    if uid == OWNER_ID:
-        return True
-
-    if uid in banned:
-        await update.message.reply_text("🚫 You are banned.")
-        return False
-
+async def is_joined(bot, uid):
     for ch in REQUIRED_CHANNELS:
         try:
-            m = await context.bot.get_chat_member(ch, uid)
-            if m.status in ("left", "kicked"):
-                raise Exception
+            m = await bot.get_chat_member(ch, uid)
+            if m.status not in ("member", "administrator", "creator"):
+                return False
         except:
-            await update.message.reply_text(
-                "❌ Join required channels first:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Join Channel 1", url="https://t.me/legendyt830")],
-                    [InlineKeyboardButton("Join Channel 2", url="https://t.me/youXyash")],
-                    [InlineKeyboardButton("✅ I Joined", callback_data="recheck")]
-                ])
-            )
             return False
-
-    users[str(uid)] = int(time.time())
-    safe_json_save(USERS_FILE, users)
     return True
 
-async def recheck_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    fake = Update(update.update_id, message=update.callback_query.message)
-    if await check_access(fake, context):
-        await update.callback_query.message.reply_text("✅ Access granted.")
+# ================== SMART SCORE ==================
 
-# ============ PROXY UTILS ============
-def parse_proxy(line):
-    p = line.strip().split(":")
-    if len(p) == 2:
-        return p[0], p[1], None, None
-    if len(p) == 4:
-        return p[0], p[1], p[2], p[3]
-    return None
+def smart_score(latency_ms, uptime):
+    return round((100 - min(latency_ms / 15, 80)) + (uptime * 15), 2)
 
-def build_proxy(proto, ip, port, u=None, pw=None):
-    if u and pw:
-        return f"{proto}://{u}:{pw}@{ip}:{port}"
-    return f"{proto}://{ip}:{port}"
+# ================== AUTO DETECT ==================
 
-AUTO_PROTOCOLS = ["https", "http", "socks5", "socks4"]
+def auto_detect(proxy):
+    if proxy.count(":") == 3:
+        return "http"
+    return "http"
 
-async def check_proxy(session, proto, proxy_line):
-    parsed = parse_proxy(proxy_line)
-    if not parsed:
-        return None
+# ================== PROXY CHECK ==================
 
-    ip, port, u, pw = parsed
-    proxy_url = build_proxy(proto, ip, port, u, pw)
+async def check_proxy(proxy, ptype):
+    start = time.time()
+    parts = proxy.split(":")
+    ip = parts[0]
 
-    start = time.perf_counter()
+    proxy_url = f"{ptype}://{proxy}"
+
     try:
-        async with session.get(
-            "http://httpbin.org/ip",
-            proxy=proxy_url,
-            timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False
-        ) as r:
-            if r.status == 200:
-                latency = int((time.perf_counter() - start) * 1000)
-                return {
-                    "proxy": proxy_line,
-                    "type": proto,
-                    "latency": latency,
-                    "country": get_country(ip),
-                }
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.get(
+                "http://httpbin.org/ip",
+                proxy=proxy_url,
+                ssl=False
+            ) as r:
+                if r.status != 200:
+                    return None
+
+        latency = int((time.time() - start) * 1000)
+        geo = geo_lookup(ip)
+
+        return {
+            "proxy": proxy,
+            "latency": latency,
+            "country": geo["country"],
+            "city": geo["city"],
+            "isp": geo["isp"],
+        }
     except:
         return None
 
-async def auto_check(session, line):
-    for proto in AUTO_PROTOCOLS:
-        res = await check_proxy(session, proto, line)
-        if res:
-            return res
-    return None
+# ================== HANDLERS ==================
 
-# ============ COMMANDS ============
-async def start(update, context):
-    if not await check_access(update, context):
-        return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_joined(context.bot, update.effective_user.id):
+        kb = [[InlineKeyboardButton("✅ I Joined", callback_data="recheck")]]
+        return await update.message.reply_text(
+            "❌ Join required channels first.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+    bans = load("ban.json")
+    if str(update.effective_user.id) in bans:
+        return await update.message.reply_text("🚫 You are banned.")
+
+    users = load("users.json")
+    users[str(update.effective_user.id)] = int(time.time())
+    save("users.json", users)
+
     await update.message.reply_text(
-        "👋 **Proxy Checker Bot**\n\nUse /check to begin.",
-        parse_mode="Markdown"
+        "🚀 *PROXY CHECKER*\n\n"
+        "• Accurate validation\n"
+        "• City / ISP / Country\n"
+        "• CPM + ETA\n"
+        "• Smart Score ranking\n\n"
+        "Use /check",
+        parse_mode="Markdown",
     )
 
-async def check(update, context):
-    if not await check_access(update, context):
-        return
+async def recheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if await is_joined(context.bot, q.from_user.id):
+        await q.message.edit_text("✅ Access granted. Use /check")
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("🌐 HTTP", callback_data="http")],
+        [InlineKeyboardButton("🔒 HTTPS", callback_data="https")],
+        [InlineKeyboardButton("🧦 SOCKS4", callback_data="socks4")],
+        [InlineKeyboardButton("🧦 SOCKS5", callback_data="socks5")],
+        [InlineKeyboardButton("⚡ AUTO", callback_data="auto")],
+    ]
     await update.message.reply_text(
-        "🧠 Select proxy type:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 HTTP", callback_data="http")],
-            [InlineKeyboardButton("🔐 HTTPS", callback_data="https")],
-            [InlineKeyboardButton("🧦 SOCKS5", callback_data="socks5")],
-            [InlineKeyboardButton("🧦 SOCKS4", callback_data="socks4")],
-            [InlineKeyboardButton("🤖 Automatic Select", callback_data="auto")],
-        ])
+        "🧠 *Select proxy type*",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown",
     )
 
-async def type_cb(update, context):
-    await update.callback_query.answer()
-    context.user_data["ptype"] = update.callback_query.data
-    await update.callback_query.message.reply_text("📤 Upload proxy .txt file")
+async def proxy_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data["ptype"] = q.data
+    await q.message.edit_text("📤 Upload proxy `.txt` file")
 
-# ============ FILE HANDLER ============
-async def file_handler(update, context):
-    if not await check_access(update, context):
-        return
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ptype = context.user_data.get("ptype")
 
-    if "ptype" not in context.user_data:
-        await update.message.reply_text("Use /check first.")
-        return
-
-    uid = str(update.effective_user.id)
-    ptype = context.user_data["ptype"]
+    if not ptype:
+        return await update.message.reply_text("❌ Select proxy type first.")
 
     file = await update.message.document.get_file()
-    content = (await file.download_as_bytearray()).decode().splitlines()
-    proxies = [x.strip() for x in content if x.strip()]
+    proxies = (await file.download_as_bytearray()).decode().splitlines()
 
-    msg = await update.message.reply_text("⏳ Checking proxies...")
+    if ptype == "auto":
+        ptype = auto_detect(proxies[0])
 
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
     results = []
-    async with aiohttp.ClientSession() as session:
-        sem = asyncio.Semaphore(50)
+    checked = 0
+    start_time = time.time()
 
-        async def run(p):
-            async with sem:
-                if ptype == "auto":
-                    return await auto_check(session, p)
-                return await check_proxy(session, ptype, p)
+    progress = await update.message.reply_text("⏳ Checking proxies...")
 
-        tasks = [run(p) for p in proxies]
-        done = 0
-
-        for coro in asyncio.as_completed(tasks):
-            r = await coro
-            done += 1
+    async def runner(p):
+        nonlocal checked
+        async with sem:
+            r = await check_proxy(p, ptype)
+            checked += 1
             if r:
                 results.append(r)
-            if done % 10 == 0:
-                await msg.edit_text(f"⏳ Progress: {done}/{len(proxies)}")
 
-    results.sort(key=lambda x: x["latency"])
+            if checked % 10 == 0 or checked == len(proxies):
+                elapsed = time.time() - start_time
+                cpm = int((checked / max(elapsed, 1)) * 60)
+                eta = int(((len(proxies) - checked) / max(checked, 1)) * elapsed)
+                await progress.edit_text(
+                    f"📊 {checked}/{len(proxies)}\n⚡ CPM: {cpm}\n⏱ ETA: {eta}s"
+                )
 
-    out_dir = HISTORY_DIR / uid
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{ptype}_{int(time.time())}.txt"
+    await asyncio.gather(*[runner(p) for p in proxies])
 
-    async with aiofiles.open(out_file, "w") as f:
+    uptime = load("uptime.json")
+    for r in results:
+        uptime[r["proxy"]] = uptime.get(r["proxy"], 0) + 1
+    save("uptime.json", uptime)
+
+    for r in results:
+        r["score"] = smart_score(r["latency"], uptime.get(r["proxy"], 1))
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    user_dir = f"{RESULTS_DIR}/{uid}"
+    os.makedirs(user_dir, exist_ok=True)
+    out = f"{user_dir}/{ptype}_live.txt"
+
+    with open(out, "w") as f:
         for r in results:
-            score = max(1, 1000 - r["latency"])
-            await f.write(
-                f"{r['proxy']} | {r['type']} | {r['country']} | {r['latency']}ms | score:{score}\n"
+            f.write(
+                f'{r["proxy"]} | {r["latency"]}ms | '
+                f'{r["country"]}/{r["city"]} | '
+                f'{r["isp"]} | SCORE:{r["score"]}\n'
             )
 
-    await msg.edit_text(
-        f"✅ Done\n\n"
-        f"✔ Live: {len(results)}\n"
-        f"❌ Dead: {len(proxies)-len(results)}"
+    checks = load("checks_count.json")
+    checks["total"] += len(proxies)
+    save("checks_count.json", checks)
+
+    await progress.edit_text(
+        f"✅ DONE\n🟢 Live: {len(results)}\n🔴 Dead: {len(proxies)-len(results)}"
+    )
+    await update.message.reply_document(document=open(out, "rb"))
+
+# ================== ADMIN ==================
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(
+        f"👑 ADMIN\n\n"
+        f"👤 Users: {len(load('users.json'))}\n"
+        f"📊 Checks: {load('checks_count.json')['total']}"
     )
 
-    if results:
-        await update.message.reply_document(open(out_file, "rb"))
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    uid = context.args[0]
+    bans = load("ban.json")
+    if uid not in bans:
+        bans.append(uid)
+    save("ban.json", bans)
+    await update.message.reply_text("🚫 Banned")
 
-# ============ MAIN ============
-def main():
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    uid = context.args[0]
+    bans = load("ban.json")
+    if uid in bans:
+        bans.remove(uid)
+    save("ban.json", bans)
+    await update.message.reply_text("✅ Unbanned")
+
+# ================== MAIN ==================
+
+async def main():
+    ensure_storage()
+    ensure_geolite()
+
+    global geo_reader
+    geo_reader = geoip2.database.Reader(GEO_DB)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
-    app.add_handler(CallbackQueryHandler(recheck_cb, pattern="recheck"))
-    app.add_handler(CallbackQueryHandler(type_cb))
-    app.add_handler(MessageHandler(filters.Document.TEXT, file_handler))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
 
-    log.info("Bot started")
-    app.run_polling()
+    app.add_handler(CallbackQueryHandler(recheck, pattern="recheck"))
+    app.add_handler(CallbackQueryHandler(proxy_type))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_file))
+
+    logging.info("✅ BOT STARTED")
+    await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
