@@ -316,7 +316,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 
-async def main():
+def main():
     ensure_storage()
     ensure_geolite_db()
 
@@ -331,10 +331,14 @@ async def main():
 
     app.add_handler(CallbackQueryHandler(recheck, pattern="recheck"))
     app.add_handler(CallbackQueryHandler(proxy_type))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_file))
+    app.add_handler(
+        MessageHandler(filters.Document.FileExtension("txt"), handle_file)
+    )
 
     logging.info("✅ BOT READY")
-    await app.run_polling()
+
+    # 🔥 THIS manages the loop itself
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
