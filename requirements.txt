@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
 aiohttp
-geoip2
 requests
+geoip2
