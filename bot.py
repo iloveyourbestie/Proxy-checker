@@ -1,4 +1,4 @@
-import os
+whatimport os
 import json
 import asyncio
 import aiohttp
@@ -257,12 +257,4 @@ def main():
 # ===========================================
 
 if __name__ == "__main__":
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            main()
-        else:
-            main()
-    except RuntimeError:
-        main()
+    main()
